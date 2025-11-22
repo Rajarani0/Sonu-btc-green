@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BTC NUCLEAR SMC SIGNAL BOT</title>
+    <style>
+        body { font-family: Arial; background: #000; color: #0f0; padding: 20px; }
+        h1 { color: #f0b90b; text-align: center; }
+        input, button { padding: 12px; margin: 8px 0; width: 100%; border-radius: 8px; border: none; font-size: 16px; }
+        button { background: #00aaff; color: white; font-weight: bold; cursor: pointer; }
+        #status { background: #222; padding: 15px; border-radius: 10px; margin: 15px 0; font-size: 18px; text-align: center; }
+        #logs { background: #111; color: #0f0; padding: 15px; height: 420px; overflow-y: scroll; font-family: monospace; border: 1px solid #333; border-radius: 10px; }
+        .signal { padding: 20px; border-radius: 15px; margin: 20px 0; display: none; font-size: 22px; text-align: center; color: white; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>BTC NUCLEAR SMC SIGNAL BOT</h1>
+    <p style="text-align:center; color:#aaa;">Binance API se live data – No API Key Needed!</p>
+
+    <label>Telegram Bot Token:</label>
+    <input type="text" id="token" placeholder="8595804085:AAGV9gVZqZ5FEmWNxveeEQnpgBL6...">
+
+    <label>Chat IDs (comma-separated):</label>
+    <input type="text" id="chatids" placeholder="1349670684,-1003329096261">
+
+    <button onclick="startBot()">START BOT</button>
+    <button onclick="stopBot()">STOP BOT</button>
+
+    <div id="status">Status: Stopped</div>
+    <div id="logs"></div>
+    <div id="signal" class="signal"></div>
+
+    <script>
+        // ==================== CONFIG ====================
+        const SYMBOL = "BTCUSDT";
+        const SCAN_INTERVAL_MS = 60 * 1000;        // 1 minute
+        const VOLUME_SPIKE_MULT = 2.3;             // BTC ke liye perfect
+        const MIN_SIGNAL_GAP = 60 * 60 * 1000;      // 1 hour cooldown ← YE LINE ADD KI HAI
+        // ===============================================
+
+        let lastSignalTime = 0;
+        let intervalId = null;
+        let isRunning = false;
+
+        function log(msg) {
+            const logs = document.getElementById('logs');
+            logs.innerHTML += new Date().toLocaleString() + ' → ' + msg + '<br>';
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function updateStatus(msg) {
+            document.getElementById('status').innerHTML = '<b>Status: ' + msg + '</b>';
+        }
+
+        async function sendTelegram(msg) {
+            const token = document.getElementById('token').value.trim();
+            if (!token) return log('Telegram token missing!');
+            const ids = document.getElementById('chatids').value.split(',').map(x => x.trim());
+            for (let id of ids) {
+                if (!id) continue;
+                const url = `https://api.telegram.org/bot${token}/sendMessage?chat_id=${id}&text=${encodeURIComponent(msg)}&parse_mode=HTML&disable_web_page_preview=true`;
+                try { await fetch(url); log('Signal sent → ' + id); } 
+                catch(e) { log('Telegram error'); }
+                await new Promise(r => setTimeout(r, 333));
+            }
+        }
+
+        // Binance se direct klines
+        async function klines(interval, limit = 300) {
+            const url = `https://api.binance.com/api/v3/klines?symbol=${SYMBOL}&interval=${interval}&limit=${limit}`;
+            try {
+                const res = await fetch(url);
+                const data = await res.json();
+                return data.map(c => ({
+                    t: c[0],
+                    o: parseFloat(c[1]),
+                    h: parseFloat(c[2]),
+                    l: parseFloat(c[3]),
+                    c: parseFloat(c[4]),
+                    v: parseFloat(c[5])
+                }));
+            } catch (e) {
+                log('Binance error: ' + e.message);
+                return [];
+            }
+        }
+
+        function ATR(candles, period = 14) {
+            if (candles.length < period + 1) return 0;
+            let atr = 0;
+            for (let i = 1; i <= period; i++) {
+                const tr = Math.max(candles[i].h - candles[i].l,
+                    Math.abs(candles[i].h - candles[i-1].c),
+                    Math.abs(candles[i].l - candles[i-1].c));
+                atr += tr;
+            }
+            atr /= period;
+            for (let i = period + 1; i < candles.length; i++) {
+                const tr = Math.max(candles[i].h - candles[i].l,
+                    Math.abs(candles[i].h - candles[i-1].c),
+                    Math.abs(candles[i].l - candles[i-1].c));
+                atr = (atr * (period - 1) + tr) / period;
+            }
+            return atr;
+        }
+
+        function detectOrderBlocks(candles) {
+            let bull = null, bear = null;
+            for (let i = 10; i < candles.length - 3; i++) {
+                const prev = candles[i-1], cur = candles[i];
+                if (prev.c < prev.o && cur.c > cur.o && cur.c > prev.h && cur.l <= prev.l)
+                    bull = { price: prev.l };
+                if (prev.c > prev.o && cur.c < cur.o && cur.c < prev.l && cur.h >= prev.h)
+                    bear = { price: prev.h };
+            }
+            return { bull, bear };
+        }
+
+        function detectFVG(candles) {
+            for (let i = 2; i < candles.length; i++) {
+                if (candles[i-2].h < candles[i].l) return 'bull';
+                if (candles[i-2].l > candles[i].h) return 'bear';
+            }
+            return null;
+        }
+
+        function isVolumeSpike(candles) {
+            if (candles.length < 15) return false;
+            const last = candles[candles.length-1].v;
+            const avg = candles.slice(-15, -1).reduce((a,b) => a + b.v, 0) / 14;
+            return last > avg * VOLUME_SPIKE_MULT;
+        }
+
+        function getBias(h4) {
+            if (h4.length < 30) return 'neutral';
+            const sma20 = h4.slice(-21).reduce((a,b) => a + b.c, 0) / 20;
+            return h4[h4.length-1].c > sma20 ? 'bull' : 'bear';
+        }
+
+        function fmt(n) { return Number(n).toFixed(0); }
+
+        async function scan() {
+            try {
+                const [m15, h1, h4] = await Promise.all([
+                    klines('15m', 200),
+                    klines('1h', 200),
+                    klines('4h', 100)
+                ]);
+
+                if (!m15.length) return log('No data received');
+
+                const price = m15[m15.length-1].c;
+                const ob15 = detectOrderBlocks(m15.slice(-80));
+                const ob1h = detectOrderBlocks(h1.slice(-80));
+                const fvg = detectFVG(m15.slice(-30));
+                const volSpike = isVolumeSpike(m15);
+                const bias = getBias(h4);
+
+                log(`BTC: $${fmt(price)} | Bias: ${bias} | VolSpike: ${volSpike?'YES':'NO'} | FVG: ${fvg||'none'}`);
+
+                const longSetup  = ob15.bull && ob1h.bull && fvg === 'bull' && volSpike && bias !== 'bear';
+                const shortSetup = ob15.bear && ob1h.bear && fvg === 'bear' && volSpike && bias !== 'bull';
+
+                // Cooldown check
+                if (Date.now() - lastSignalTime < MIN_SIGNAL_GAP) {
+                    if (longSetup || shortSetup) log('Perfect setup found but 1h cooldown active');
+                    return;
+                }
+
+                if (longSetup || shortSetup) {
+                    const atr = ATR(m15, 14);
+                    const entry = price;
+                    const slBuffer = Math.max(atr * 1.3, 150);
+                    let sl, tp;
+                    if (longSetup) {
+                        sl = ob15.bull.price - slBuffer;
+                        tp = entry + (entry - sl) * 5;
+                    } else {
+                        sl = ob15.bear.price + slBuffer;
+                        tp = entry - (sl - entry) * 5;
+                    }
+
+                    const msg = `<b>BTC NUCLEAR SMC SIGNAL</b>\n` +
+                        `${longSetup ? "LONG" : "SHORT"}\n\n` +
+                        `Entry : <b>$${fmt(entry)}</b>\n` +
+                        `SL     : <b>$${fmt(sl)}</b>\n` +
+                        `TP     : <b>$${fmt(tp)}</b>\n` +
+                        `RR     : <b>1:5</b>\n\n` +
+                        `Setup: OB + FVG + Volume Spike + 4h Bias\n` +
+                        `${new Date().toLocaleString()}`;
+
+                    await sendTelegram(msg);
+                    lastSignalTime = Date.now();
+                    log(`NUCLEAR ${longSetup?'LONG':'SHORT'} FIRED @ $${fmt(entry)}`);
+
+                    const sig = document.getElementById('signal');
+                    sig.innerHTML = msg.replace(/\n/g, '<br>');
+                    sig.style.background = longSetup ? '#006400' : '#8B0000';
+                    sig.style.display = 'block';
+                }
+
+            } catch (e) {
+                log('Scan error: ' + e.message);
+            }
+        }
+
+        function startBot() {
+            if (isRunning) return;
+            isRunning = true;
+            updateStatus('RUNNING – BTC NUCLEAR BOT ACTIVE');
+            scan();
+            intervalId = setInterval(scan, SCAN_INTERVAL_MS);
+            log('BTC Nuclear SMC Bot Started – Waiting for perfect setup...');
+        }
+
+        function stopBot() {
+            clearInterval(intervalId);
+            isRunning = false;
+            updateStatus('Stopped');
+            log('Bot stopped');
+        }
+    </script>
+</body>
+</html>
